@@ -30,7 +30,7 @@ if ($arg && $arg eq "config") {
 
 my $sock = new IO::Socket::UNIX(
 	Type => SOCK_STREAM,
-	Peer => "/tmp/rrdcached.munin.sock",
+	Peer => "/var/run/rrdcached.sock",
 ) or die "Cannot open socket : $!";
 
 print $sock "STATS\n";
