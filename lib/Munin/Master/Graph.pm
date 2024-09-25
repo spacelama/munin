@@ -39,6 +39,9 @@ use Munin::Common::Logger;
 use File::Basename;
 use Data::Dumper;
 
+# We don't care anymore for rrdtool less than 1.4
+die "Munin requires at least version 1.4 of RRD\n" if $RRDs::VERSION < 1.4;
+
 # Hash of available palettes
 my %PALETTE;
 # Array of colours to use
@@ -56,13 +59,40 @@ my @COLOUR;
 	# New default palette. Better contrast & more colours
 	# Line variations: Pure, earthy, dark pastel, misc colours
 	$PALETTE{'default'} = [
-		#Greens Blues   Oranges Dk yel  Dk blu  Purple  lime    Reds    Gray
-		qw(00CC00 0066B3 FF8000 FFCC00 330099 990099 CCFF00 FF0000 808080
-			008F00 00487D B35A00 B38F00	 6B006B 8FB300 B30000 BEBEBE
+		#  	Green  Blue   Orange Dk yel Dk blu Purple Lime   Reds   Gray
+		qw(	00CC00 0066B3 FF8000 FFCC00 330099 990099 AACC00 FF0000 808080
+			008F00 00487D B35A00 B38F00 6B006B 8FB300 B30000 BEBEBE
 			80FF80 80C9FF FFC080 FFE680 AA80FF EE00CC FF8080
 			666600 FFBFFF 00FFCC CC6699 999900
 	)];
 }
+
+# FIXME: These things affect the legend width:
+# - Normal plot:  6 positions for each column
+# - Base 1024:    7 positions for each column
+# - graph_scale: +1 position for SI unit for column
+# - negative:    *2+1 positons: *1 for +, *1 for - and 1 for /
+
+# As it is now: The first set for "normal" graphs, the second set for
+# graphs with .negative plotting
+
+my @rrd_legend_headers = (
+    [ "COMMENT:Cur ", "COMMENT:Min ", "COMMENT:Avg ", "COMMENT:Max   \\j" ],
+    [ "COMMENT:Cur -/+     ",
+      "COMMENT:Min -/+     ",
+      "COMMENT:Avg -/+     ",
+      "COMMENT:Max -/+     \\j", ]
+    );
+
+# FIXME: Likewise the longest label length that can be fitted _with_
+# the numbers on a legend line varies with all the cases above.
+#
+# The longest a label can be without using two lines, "the longest a
+# short label can be".
+#
+# Note: SVG somehow has shorter line length!
+my $longest_short = 18;      # Regular plot
+my $longest_short_neg = 8;   # Plot with .negative series
 
 # Obviously use the default one
 @COLOUR = @{ $PALETTE{'default'} };
@@ -162,7 +192,7 @@ sub handle_request
 	if (not defined($sth_url)) {
 		# potential cause: permission problem
 		my $msg = "Failed to access database: " . $DBI::errstr;
-		WARNING "[WARNING] $msg";
+		WARNING $msg;
 		die $msg;
 	}
 	$sth_url->execute($graph_path);
@@ -187,6 +217,8 @@ sub handle_request
 
 	DEBUG "found node=$id, type=$type";
 
+	my $dbdir = get_param("dbdir");
+
 	# Here's the most common case: only plain plugins
 	my $sth;
 
@@ -203,6 +235,8 @@ sub handle_request
 	my ($graph_vlabel) = $sth->fetchrow_array();
 	$graph_vlabel =~ s/\$\{graph_period\}/$graph_period/g if $graph_vlabel;
 
+	# Note: This will be the graph order computed in munin-update,
+	# not the graph_order emitted by the plugin.
 	$sth->execute($id, "graph_order");
 	my ($graph_order) = $sth->fetchrow_array() || "";
 	DEBUG "graph_order: $graph_order";
@@ -218,6 +252,15 @@ sub handle_request
 		# If the base unit is 1024 then 1012.56 is a valid
 		# number to show.  That's 7 positions, not 6.
 		$graph_printf = ($graph_args =~ /--base\s+1024/) ? "%7.2lf" : "%6.2lf";
+	}
+
+	$sth->execute($id, "graph_scale");
+	my ($graph_scale) = $sth->fetchrow_array() || "";
+	DEBUG "graph_scale: $graph_scale";
+	if (lc($graph_scale) eq 'no') {
+	    $graph_scale = 0;
+	} else {
+	    $graph_scale = 1;
 	}
 
 	DEBUG "graph_printf: $graph_printf";
@@ -251,7 +294,7 @@ sub handle_request
 		LEFT OUTER JOIN ds_attr rd ON rd.id = ds.id AND rd.name = 'rrd:field'
 		LEFT OUTER JOIN ds_attr ra ON ra.id = ds.id AND ra.name = 'rrd:alias'
 		LEFT OUTER JOIN ds_attr rc ON rc.id = ds.id AND rc.name = 'cdef'
-		LEFT OUTER JOIN ds_attr gc ON gc.id = ds.id AND gc.name = 'gfx:color'
+		LEFT OUTER JOIN ds_attr gc ON gc.id = ds.id AND gc.name = 'colour'
 		LEFT OUTER JOIN ds_attr gd ON gd.id = ds.id AND gd.name = 'draw'
 		LEFT OUTER JOIN ds_attr gds ON gds.id = ds.id AND gds.name = 'drawstyle'
 		LEFT OUTER JOIN ds_attr pf ON pf.id = ds.id AND pf.name = 'printf'
@@ -264,8 +307,34 @@ sub handle_request
 	");
 	$sth->execute($id);
 
+	# Collect the field set in the graph and
+	my $graph_has_negative = 0;
+	my $longest_fieldname = 0;
+	my %row;
+
+	while (my ($_rrdname, @rest) = $sth->fetchrow_array()) {
+	    $row{$_rrdname} = \@rest;
+
+	    my $l = length($_rrdname);
+	    $longest_fieldname = $l if $l > $longest_fieldname;
+	    $graph_has_negative = 1 if $rest[9];
+	}
+
+	DEBUG "Graph survey: graph_has_negatives: $graph_has_negative, longest field name: $longest_fieldname";
+
+	# To be robust and sure to be complete we apply the computed
+	# graph_order here and any fields left over is added at the
+	# end in alphabetical order. They will not have been in the
+	# plugin "config" output.
+	my %seen;
+	my @graph_order = grep { $seen{$_}++ == 0 }
+	  ( split(/ +/, $graph_order), sort keys %row );
+
+	# Now @graph_order contains all the rrd field names, in the desired order
+
+	DEBUG "Finalized graph order: ".join(', ', @graph_order);
+
 	# Construction of the RRD command line
-	# We don't care anymore for rrdtool less than 1.4
 	my @rrd_def;
 	my @rrd_cdef;
 	my @rrd_vdef;
@@ -274,12 +343,6 @@ sub handle_request
 	my @rrd_legend;
 	my @rrd_sum;
 
-	push @rrd_gfx, "COMMENT:\\t";
-	push @rrd_gfx, "COMMENT:Cur\\t";
-	push @rrd_gfx, "COMMENT:Min\\t";
-	push @rrd_gfx, "COMMENT:Avg\\t";
-	push @rrd_gfx, "COMMENT:Max\\t\\r";
-
 	# CDEF dictionary
 	my %rrd_cdefs;
 
@@ -287,8 +350,28 @@ sub handle_request
 
 	my $first_def;
 	my $field_number = 0;
-	while (my (
-			$_rrdname, $_label,
+
+	my $longest = $longest_short;
+	my $legendhead = 0; # See $rrd_legend_headers
+
+	if ($graph_has_negative) {
+	    $legendhead = 1;
+	    $longest = $longest_short_neg;
+	}
+	my $PAD = "COMMENT:" . (' ' x $longest);
+	my $LPAD = "COMMENT:" . (' ' x ($longest+2));
+
+	# Get out the right legend for this graph and then put in some
+	# alignment.
+	@rrd_legend = @{$rrd_legend_headers[$legendhead]};
+	unshift(@rrd_legend, $LPAD);
+	DEBUG "RRD legend: ".join(", ", @rrd_legend);
+
+	# ^^^^ There used to be a \j here, but I think that was wrong.
+	# This note is here to remind me in case _I_ was wrong.
+
+	foreach my $_rrdname (@graph_order) {
+	        my ($_label,
 			$_rrdfile, $_rrdfield, $_rrdalias, $_rrdcdef,
 			$_color, $_drawtype,
 			$_drawstyle,
@@ -297,8 +380,8 @@ sub handle_request
 			$_sum,
 			$_stack,
 			$_has_negative,
-			$_lastupdated,
-		) = $sth->fetchrow_array()) {
+		    $_lastupdated) = @{$row{$_rrdname}};
+
 		# Note that we do *NOT* provide any defaults for those
 		# $_rrdXXXX vars. Defaults will be done by munin-update.
 		#
@@ -307,14 +390,14 @@ sub handle_request
 		# 	- reduce the size of the CGI part, which is good for
 		# 	  security (& sometimes performances)
 
-		# Fields inherit this field from their plugin, if not overridden
+		# Fields inherit this field from their plugin, if not overridden by the field
 		$_printf = $graph_printf unless defined $_printf;
-		$_printf .= "%s";
+		$_printf .= "%s" if $graph_scale;
 
 		# The label is the fieldname if not present
 		$_label = $_rrdname unless $_label;
 
-		DEBUG "rrdname: $_rrdname";
+		DEBUG "rrdname: $_rrdname: negative: ".($_negative // "undef")." has_negative: ".($_has_negative // "undef");
 
 		# rrdtool fails on unescaped colons found in its input data
 		$_label =~ s/:/\\:/g;
@@ -372,6 +455,8 @@ sub handle_request
 			($_rrdfile, $_rrdfield, $_lastupdated) = get_alias_rrdfile($dbh, $_rrdalias);
 		}
 
+		$_rrdfile = File::Spec->catfile($dbdir, $_rrdfile);
+
 		# Fetch the data from the RRDs
 		my $rrd_is_virtual = is_virtual($_rrdname, $_rrdcdef);
 		my $rrd_is_cdef = defined $_rrdcdef && $_rrdcdef ne "";
@@ -412,54 +497,66 @@ sub handle_request
 		# ... But we did still want to compute the related DEF & CDEF
 		next if $_has_negative;
 
-		push @rrd_gfx, "$_drawtype:avg_$_rrdname#$_color:$_label$_drawstyle\\l";
-
-		# Legend
 		push @rrd_vdef, "VDEF:vavg_$_rrdname=avg_$_rrdname,AVERAGE";
 		push @rrd_vdef, "VDEF:vmin_$_rrdname=min_$_rrdname,MINIMUM";
 		push @rrd_vdef, "VDEF:vmax_$_rrdname=max_$_rrdname,MAXIMUM";
-
 		push @rrd_vdef, "VDEF:vlst_$_rrdname=avg_$_rrdname,LAST";
 
-		my $is_label_small = length($_label) <= 20;
-		if ($is_label_small) {
-			push @rrd_gfx, "COMMENT:\\u"; # Rewind the line, to have \r after the \l
-		}
+		my $drawcmd = "$_drawtype:avg_$_rrdname#$_color:";
 
+		# FIXME: This becomes sub-optimal if we in a -/+ plot
+		# has a line that does not have a .negative, because
+		# then the label can be longer anyway.  Example: if__err plugin
+		my $shortlabel = ( length($_label) <= $longest );
+
+		DEBUG "Longest $longest, '$_label' is short? $shortlabel";
+
+		if ($shortlabel) {
+		    push @rrd_gfx, $drawcmd.sprintf("%-${longest}s$_drawstyle",$_label);
+		} else {
+		    push @rrd_gfx, $drawcmd."$_label$_drawstyle\\l", $LPAD;
+		}
 
 		# Handle negatives
 		if ($_negative) {
-			# We'll have a negative counterpart
+		        DEBUG "Negative of $_rrdname is $_negative";
+
+			# These are for plotting! Sign is reversed to
+			# plot them under the X-axis
 			push @rrd_vdef, "CDEF:avg_n_$_rrdname=avg_$_negative,-1,*";
 			push @rrd_vdef, "CDEF:min_n_$_rrdname=min_$_negative,-1,*";
 			push @rrd_vdef, "CDEF:max_n_$_rrdname=max_$_negative,-1,*";
 
-			push @rrd_vdef, "VDEF:vavg_n_$_rrdname=avg_n_$_rrdname,AVERAGE";
-			push @rrd_vdef, "VDEF:vmin_n_$_rrdname=min_n_$_rrdname,MINIMUM";
-			push @rrd_vdef, "VDEF:vmax_n_$_rrdname=max_n_$_rrdname,MAXIMUM";
-
-			push @rrd_vdef, "VDEF:vlst_n_$_rrdname=avg_n_$_rrdname,LAST";
+			# These are for the legend! Original sign,
+			# because we want to see the original value
+			# read, not the negated value used to plot
+			push @rrd_vdef, "VDEF:vavg_$_negative=avg_$_negative,AVERAGE";
+			push @rrd_vdef, "VDEF:vmin_$_negative=min_$_negative,MINIMUM";
+			push @rrd_vdef, "VDEF:vmax_$_negative=max_$_negative,MAXIMUM";
+			push @rrd_vdef, "VDEF:vlst_$_negative=avg_$_negative,LAST";
 		}
 
-		# Displaying the values as POSITIVE/NEGATIVE if $_negative
-		push @rrd_gfx, "COMMENT:\\t";
-
+		my $end = '';
 		for my $t (qw(lst min avg max)) {
-			if (! $_negative) {
-				push @rrd_gfx, "GPRINT:v$t"."_$_rrdname:$_printf\\t";
+			$end = '\j' if $t eq 'max';
+
+			if ($_negative) {
+			    push @rrd_gfx, "GPRINT:v$t"."_$_negative:$_printf/\\g";
+			    push @rrd_gfx, "GPRINT:v$t"."_$_rrdname:$_printf$end";
 			} else {
-				push @rrd_gfx, "GPRINT:v$t"."_$_rrdname:$_printf\\g";
-				push @rrd_gfx, "COMMENT:/\\g";
-				push @rrd_gfx, "GPRINT:v$t"."_n_$_rrdname:$_printf\\g";
+			    push @rrd_gfx, "GPRINT:v$t"."_$_rrdname:$_printf$end";
 			}
 		}
 
-		push @rrd_gfx, "COMMENT:\\r";
-
-		# Push to another array, to have these at the end
 		push @rrd_gfx_negatives, "$_drawtype:avg_n_$_rrdname#$_color" if $_negative;
 
+		DEBUG "_lastupdated: ".($_lastupdated // '(undef)').
+		    " lastupdated: ".($lastupdated // '(undef)');
+
 		$lastupdated = $_lastupdated if ! defined $lastupdated || ($_lastupdated && $_lastupdated > $lastupdated);
+
+		# Last resort
+		$lastupdated = RRDs::last($_rrdfile) if !$lastupdated and $_rrdfile;
 	} continue {
 		# Move to here so it's always executed
 		$field_number ++;
@@ -485,19 +582,17 @@ sub handle_request
 		}
 	}
 
-	DEBUG "rrd_def @rrd_def";
-
 	# $end is possibly in future
 	$end = $end ? $end : time;
 	$lastupdated = "" unless $lastupdated;
-	DEBUG "[DEBUG] lastupdate: $lastupdated, end: $end\n";
+	DEBUG "lastupdate: $lastupdated, end: $end\n";
 
 	# future begins at this horizontal ruler
 	if ($lastupdated) {
 		# TODO - we have to find the last updated for aliased items
-		push(@rrd_gfx, "VRULE:$lastupdated#999999:Last update:dashes=2,5");
-		my $last_update_str = escape_for_rrd(scalar localtime($lastupdated));
-		push @rrd_gfx, "COMMENT:\\u";
+		push(@rrd_gfx, "VRULE:$lastupdated#999999::dashes=2,5");
+		my $last_update_str = escape_for_rrd("Last update: ".localtime($lastupdated));
+		# push @rrd_gfx, "COMMENT:\\u";
 		push @rrd_gfx, "COMMENT:$last_update_str\\r";
 	}
 
@@ -542,9 +637,9 @@ sub handle_request
 		"--start", $start,
 		"--slope-mode",
 
+		'--font', "LEGEND:$font_size_legend",
 		'--font', "TITLE:$font_size_title:Sans",
 		'--font', "DEFAULT:$font_size_default",
-		'--font', "LEGEND:$font_size_legend",
 		# Colors coordinated with CSS.
 		'--color', 'BACK#F0F0F0',   # Area around the graph
 		'--color', 'FRAME#F0F0F0',  # Line around legend spot
@@ -570,8 +665,8 @@ sub handle_request
 	{
 		my $lower_limit  = $cgi->url_param("lower_limit");
 		my $upper_limit  = $cgi->url_param("upper_limit");
-		push @rrd_header, "--lower" , $lower_limit if defined $lower_limit;
-		push @rrd_header, "--upper" , $upper_limit if defined $upper_limit;
+		push @rrd_header, "--lower-limit" , $lower_limit if defined $lower_limit;
+		push @rrd_header, "--upper-limit" , $upper_limit if defined $upper_limit;
 
 		# Adding --rigid, otherwise the limits are not taken into account.
 		push @rrd_header, "--rigid" if defined $lower_limit || defined $upper_limit;
@@ -600,21 +695,25 @@ sub handle_request
 		@rrd_def,
 		@rrd_cdef,
 		@rrd_vdef,
+		@rrd_legend,
 		@rrd_gfx,
 		@rrd_gfx_negatives,
-		@rrd_legend,
 	);
 
-	# Add the night/day cycle at the extreme end, so it can be in the background
+	# Add the night/day cycle at the extreme end, so it can be in
+	# the background. The first batch here is for above X-axis, the
+	# second below X-axis.
 	if (defined $first_def) {
 		push @rrd_cmd, (
 			"CDEF:dummy_val=$first_def",
 			"CDEF:n_d_b=LTIME,86400,%,28800,LT,INF,LTIME,86400,%,64800,GE,INF,UNKN,dummy_val,*,IF,IF",
 			"CDEF:n_d_c=LTIME,604800,%,172800,GE,LTIME,604800,%,345600,LT,INF,UNKN,dummy_val,*,IF,UNKN,dummy_val,*,IF",
+			"CDEF:n_d_b2=LTIME,86400,%,28800,LT,NEGINF,LTIME,86400,%,64800,GE,NEGINF,UNKN,dummy_val,*,IF,IF",
+			"CDEF:n_d_c2=LTIME,604800,%,172800,GE,LTIME,604800,%,345600,LT,NEGINF,UNKN,dummy_val,*,IF,UNKN,dummy_val,*,IF",
 		);
 
-		push @rrd_cmd, "AREA:n_d_b#00519909" unless grep { $_ eq $time } ("month", "year");
-		push @rrd_cmd, "AREA:n_d_c#AAABA11F" unless grep { $_ eq $time } ("year");
+		push @rrd_cmd, "AREA:n_d_b#00519909","AREA:n_d_b2#00519909" unless grep { $_ eq $time } ("month", "year");
+		push @rrd_cmd, "AREA:n_d_c#AAABA11F","AREA:n_d_c2#AAABA11F" unless grep { $_ eq $time } ("year");
 
 	} else {
 		WARN "day/night not working for [$path] as \$first_def is NULL";
@@ -625,8 +724,12 @@ sub handle_request
 		@rrd_cmd,
 	);
 	if ($err) {
-		INFO "'" . join("' \\\n'", @rrd_cmd) . "'";
+	        print "HTTP/1.1 400 Bad Request\r\n";
+                print $cgi->header('-Content-type' => 'text/plain');
+                print "RRD error, consult server logs\r\n";
+
 		ERROR "RRD error generating image for [$path]: ". $err;
+                ERROR "Complete RRD command: rrdtool graph '".join("' \\\n\t'", @rrd_cmd)."'";
 	};
 
 	# Sending the file
@@ -655,7 +758,7 @@ sub handle_request
 	}
 
 CLEANUP:
-	$dbh->disconnect() if $dbh;
+	$dbh = undef;
 
 	my $ttot = Time::HiRes::time;
 	DEBUG sprintf("total:%.3fs (db:%.3fs rrd:%.3fs)",
@@ -716,7 +819,6 @@ sub expand_cdef {
 sub RRDs_graph {
 	# RRDs::graph() is *STATEFUL*. It doesn't emit the same PNG
 	# when called the second time.
-	#
 	RRDs::graph(@_);
 	my $rrd_error = RRDs::error();
 	return $rrd_error;
@@ -725,16 +827,25 @@ sub RRDs_graph {
 sub RRDs_graph_or_dump {
 	use RRDs;
 
-	my $fileext = shift;
-	if ($fileext =~ m/PNG|SVG|EPS|PDF/) {
-		return RRDs_graph(@_);
+	# Appending $RRD_EXTRA_ARGS if present
+	if ($ENV{RRD_EXTRA_ARGS}) {
+		# Beware, the split is rather simple, and does not
+		# handle the following : "this contains spaces"
+		my @RRD_EXTRA_ARGS = split(/ /, $ENV{RRD_EXTRA_ARGS});
+		push @_, @RRD_EXTRA_ARGS;
 	}
 
-	DEBUG "[DEBUG] RRDs_graph(fileext=$fileext)";
+	my $fileext = shift;
+	if ($fileext =~ m/PNG|SVG|EPS|PDF/) {
+		RRDs_graph(@_);
+		return RRDs::error;
+	}
+
+	DEBUG "RRDs_graph(fileext=$fileext)";
 	my $outfile = shift @_;
 
 	# Open outfile
-	DEBUG "[DEBUG] Open outfile($outfile)";
+	DEBUG "Open outfile($outfile)";
 	my $out_fh = new IO::File(">$outfile");
 
 	# Remove unknown args
@@ -762,7 +873,7 @@ sub RRDs_graph_or_dump {
 		# Ignore the arg
 	}
 	# Now we have to fetch the textual values
-	DEBUG "[DEBUG] \n\nrrdtool xport '" . join("' \\\n\t'", @xport) . "'\n";
+	DEBUG "\n\nrrdtool xport '" . join("' \\\n\t'", @xport) . "'\n";
 	my ($start, $end, $step, $nb_vars, $columns, $values) = RRDs::xport(@xport);
 	if ($fileext eq "CSV") {
 		print $out_fh '"epoch", "' . join('", "', @{ $columns } ) . "\"\n";
@@ -878,6 +989,18 @@ sub get_alias_rrdfile
 	DEBUG "($_alias_service $_alias_ds) = ($_rrdfile $_rrdfield, $_lastupdated)";
 
 	return ($_rrdfile, $_rrdfield, $_lastupdated);
+}
+
+sub get_param
+{
+	my ($param) = @_;
+
+	# Ok, now SQL is needed to go further
+        use DBI;
+	my $datafilename = $ENV{MUNIN_DBURL} || "$Munin::Common::Defaults::MUNIN_DBDIR/datafile.sqlite";
+	my $dbh = Munin::Master::Update::get_dbh(1);
+	my ($value) = $dbh->selectrow_array("SELECT value FROM param WHERE name = ?", undef, ($param));
+	return $value;
 }
 
 1;

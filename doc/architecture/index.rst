@@ -26,7 +26,7 @@ The master is responsible for all central Munin-related tasks.
 
 
 It regularly connects to the various nodes, and then :ref:`synchronously <protocol-index>`
-asks for the various metrics configuration and values and stores the data in `RRD <https://oss.oetiker.ch/rrdtool/>` files.
+asks for the various metrics configuration and values and stores the data in `RRD <https://oss.oetiker.ch/rrdtool/>`_ files.
 
 On the fly the values are checked against limits (that you may set)
 and the Munin-Master will croak, if values go above or below the given thresholds.
@@ -74,6 +74,7 @@ We have some more standard arguments, which play a role in the process of automa
         ../plugin/multigraphing.rst
         ../plugin/protocol-dirtyconfig.rst
         ../plugin/protocol-multigraph.rst
+        ../plugin/protocol-cap.rst
         ../plugin/snmp.rst
         ../plugin/use.rst
         ../plugin/writing-tips.rst

@@ -74,8 +74,7 @@ otherwise.
 
 .. option:: includedir <path>
 
-   (Exactly one) directory to include all files from.
-   Default ``/etc/munin/plugin-conf.d/``
+   Directory to include additional configuration files from.  All the files in the directory are read.  This directive can be used just once.  There is no default but the default installation procedure configures it to ``/etc/munin/munin-conf.d``.
 
 .. option:: local_address <address>
 
@@ -123,6 +122,7 @@ otherwise.
 
 .. option:: html_dynamic_images 1
 
+   Available since Munin 2.1.0.
    Munin HTML templates use this variable to decide whether to use dynamic
    ("lazy") loading of images with javascript so that images are loaded as they
    are scrolled in view. This prevents excessive load on the web server.
@@ -374,6 +374,13 @@ only to that node.
 
    If you make a virtual node which borrow data from real nodes for aggregate graphs, set this to
    "no" for that node.
+
+.. option:: update_priority <number>
+
+   Manually define the priority that nodes will be handled.  Lower numbers are run first.
+
+   For highest overall throughput, slow running nodes should be run first.  Numbers do not have
+   to be unique, and unspecified nodes are placed at the end of the list.
 
 .. _master-conf-plugin-directives:
 

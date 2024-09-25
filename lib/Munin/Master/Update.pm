@@ -30,7 +30,6 @@ sub new {
     my $self = bless {
         old_service_configs => {},
         old_version         => undef,
-        service_configs     => {},
         workers             => [],
         failed_workers      => [],
         group_repository    => Munin::Master::GroupRepository->new($gah),
@@ -78,8 +77,6 @@ sub get_dbh {
 	use DBI;
 	my %db_args;
 	$db_args{ReadOnly} = 1 if $is_read_only;
-	#	$db_args{AutoCommit} = 0 if $is_read_only;
-	$db_args{AutoCommit} = 0;
 	$db_args{RaiseError} = 1;
 
 	use Carp;
@@ -87,7 +84,25 @@ sub get_dbh {
 
 	my $dbh = DBI->connect("dbi:$db_driver:dbname=$datafilename", $db_user, $db_passwd, \%db_args) or die $DBI::errstr;
 
-	DEBUG 'get_dbh: $dbh->{Driver}->{Name} = ' . $dbh->{Driver}->{Name};
+	INFO 'get_dbh: $dbh->{Driver}->{Name} = ' . $dbh->{Driver}->{Name} . ($is_read_only ? "(ro)" : "(rw)");
+
+	# Sets some session vars
+
+	# db_journal_mode is only set explicitely. Otherwise use the platform SQLite default
+	my $db_journal_mode = $ENV{MUNIN_DB_JOURNAL_MODE} || $config->{db_journal_mode};
+	if ($db_journal_mode) {
+		$dbh->do("PRAGMA journal_mode=$db_journal_mode;") if $db_driver eq "SQLite";
+		DEBUG "get_dbh: PRAGMA journal_mode=$db_journal_mode;" if $db_driver eq "SQLite";
+	}
+
+	my $db_synchronous_mode = $ENV{MUNIN_DB_SYNCHRONOUS_MODE} || $config->{db_synchronous_mode} || "OFF";
+	$dbh->do("PRAGMA main.synchronous=$db_synchronous_mode;") if $db_driver eq "SQLite";
+	DEBUG "get_dbh: PRAGMA main.synchronous=$db_synchronous_mode;" if $db_driver eq "SQLite";
+
+	# AutoCommit when readonly is a no-op anyway
+	$dbh->{AutoCommit} = $ENV{MUNIN_DB_AUTOCOMMIT} || $config->{db_autocommit} || 0;
+	$dbh->{AutoCommit} = 1 if $is_read_only;
+	DEBUG "get_dbh: {AutoCommit} = " . $dbh->{AutoCommit};
 
 	# Plainly returns it, but do *not* put it in $self, as it will let Perl
 	# do its GC properly and closing it when out of scope.
@@ -110,11 +125,11 @@ sub _create_workers {
 
     my @hosts = $self->{group_repository}->get_all_hosts();
 
-    # Shuffle @hosts to avoid always having the same ordering
-    # XXX - It might be best to preorder them on the TIMETAKEN ASC
-    #       in order that statistically fast hosts are done first to increase
-    #       the global throughtput
+    # Use user-defined ordering, slow hosts should run first for
+    # better global throughput, keep shuffle() to shuffle hosts within
+    # same update_order
     @hosts = shuffle(@hosts);
+    @hosts = sort { $a->{update_priority} <=> $b->{update_priority} } @hosts;
 
     if (defined $config->{limit_hosts} && %{$config->{limit_hosts}}) {
         @hosts = grep { $config->{limit_hosts}{$_->{host_name}} } @hosts
@@ -176,10 +191,10 @@ sub _run_workers {
 	my $nb_workers_failed = 0;
 	$pm->run_on_finish(
 		sub {
-			my ($pid, $exit_code, $ident) = @_;
+			my ($pid, $exit_code) = @_;
 
 			$exit_code = 0 unless defined $exit_code;
-			INFO "[INFO]: run_on_finish(pid:$pid, exit_code:$exit_code, ident:$ident)";
+			INFO "[INFO]: run_on_finish(pid:$pid, exit_code:$exit_code)";
 
 			$nb_workers_failed++ if $exit_code;
 		}
@@ -189,6 +204,8 @@ sub _run_workers {
 	for my $worker (@{$self->{workers}}) {
 		my $worker_pid = $pm->start($worker);
 		next WORKER_LOOP if $worker_pid;
+
+		my $start_time = Time::HiRes::time;
 
 		my $res;
 		eval {
@@ -202,7 +219,7 @@ sub _run_workers {
 		$worker->{dbh}->disconnect();
 
 		my $worker_id = $worker->{ID};
-		if (! defined($res) || $@) {
+		if (! $res || $@) {
 			# No res, something went wrong
 			# Note that we handle connection failure same as other
 			# failures. Since "do_connect()" fails only softly.
@@ -210,7 +227,8 @@ sub _run_workers {
 			$pm->finish(1, [ $worker_id ] );
 		}
 
-		$self->_handle_worker_result([$worker_id, $res]);
+		my $time_used = Time::HiRes::time - $start_time;
+		$self->_handle_worker_result([$worker_id, $time_used]);
 		$pm->finish(); # Return 0
 	}
 
@@ -230,14 +248,12 @@ sub _handle_worker_result {
 	LOGCROAK("[FATAL] Handle_worker_result got handed a failed worker result");
     }
 
-    my ($worker_id, $time_used, $service_configs)
-        = ($res->[0], $res->[1]{time_used}, $res->[1]{service_configs});
+    my ($worker_id, $time_used)
+        = ($res->[0], $res->[1],);
 
     my $update_time = sprintf("%.2f", $time_used);
     INFO "[INFO]: Munin-update finished for node $worker_id ($update_time sec)";
     $self->_db_stats("UD", $worker_id, $time_used);
-
-    $self->{service_configs}{$worker_id} = $service_configs;
 }
 
 sub _db_init {
@@ -248,7 +264,6 @@ sub _db_init {
 	$db_serial_type = "SERIAL" if $db_driver eq "Pg";
 
 	# Sets some session vars
-	$dbh->do("PRAGMA journal_mode=DELETE;") if $db_driver eq "SQLite";
 	$dbh->do("SET LOCAL client_min_messages = error") if $db_driver eq "Pg";
 
 	# Initialize DB Schema

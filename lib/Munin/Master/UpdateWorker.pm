@@ -17,7 +17,6 @@ use Munin::Master::Config;
 use Munin::Master::Node;
 use Munin::Master::Utils;
 use RRDs;
-use Time::HiRes;
 use Data::Dumper;
 use Scalar::Util qw(weaken);
 
@@ -74,7 +73,7 @@ sub do_work {
     $uri = new URI("munin://" . $url) unless $uri->scheme;
 
     my $nodedesignation;
-    if ($uri->scheme eq "ssh" || $uri->scheme eq "cmd") {
+    if ($uri->scheme eq "ssh" || $uri->scheme eq "cmd" || $uri->scheme eq "unix") {
         $nodedesignation = $host . " (" . $self->{host}{address} . ")";
     } else {
         $nodedesignation = $host . " (" . $self->{host}{address} . ":" . $self->{host}{port} . ")";
@@ -121,28 +120,28 @@ sub do_work {
 
 		# Handle spoolfetch, one call to retrieve everything
 		if (grep /^spool$/, @node_capabilities) {
-		my $spoolfetch_last_timestamp = $self->get_spoolfetch_timestamp();
-		local $0 = "$0 s($spoolfetch_last_timestamp)";
+			my $spoolfetch_last_timestamp = $self->get_spoolfetch_timestamp();
+			local $0 = "$0 s($spoolfetch_last_timestamp)";
 
-		# We do inject the update handling, in order to have on-the-fly
-		# updates, as we don't want to slurp the whole spoolfetched output
-		# and process it later. It will surely timeout, and use a truckload
-		# of RSS.
-		my $timestamp = $node->spoolfetch($spoolfetch_last_timestamp, sub {
+			# We do inject the update handling, in order to have on-the-fly
+			# updates, as we don't want to slurp the whole spoolfetched output
+			# and process it later. It will surely timeout, and use a truckload
+			# of RSS.
+			my $timestamp = $node->spoolfetch($spoolfetch_last_timestamp, sub {
 				my ($plugin, $now, $data, $last_timestamp, $update_rate_ptr) = @_;
 				INFO "spoolfetch config ($plugin, $now)";
 				local $0 = "$0 t($now) c($plugin)";
 				$self->uw_handle_config( @_ );
-		} );
+			} );
 
-		# update the timestamp if we spoolfetched something
-		$self->set_spoolfetch_timestamp($timestamp) if $timestamp;
+			# update the timestamp if we spoolfetched something
+			$self->set_spoolfetch_timestamp($timestamp) if $timestamp;
 
-		# Note that spoolfetching hosts is always a success. BY DESIGN.
-		# Since, if we cannot connect, or whatever else, it is NOT an issue.
+			# Note that spoolfetching hosts is always a success. BY DESIGN.
+			# Since, if we cannot connect, or whatever else, it is NOT an issue.
 
-		# No need to do more than that on this node
-		goto NODE_END;
+			# No need to do more than that on this node
+			goto NODE_END;
 	}
 
 	# Note: A multigraph plugin can present multiple services.
@@ -238,11 +237,9 @@ FETCH_OK:
     }); # do_in_session
 
     # This handles failure in do_in_session,
-    return if ! $done || ! $done->{exit_value};
+    return 0 if ! $done || ! $done->{exit_value};
 
-    return {
-        time_used => Time::HiRes::time - $update_time,
-    }
+    return 1;
 }
 
 sub _db_url {
@@ -401,19 +398,6 @@ sub _db_service {
 		$self->_db_service_attr($service_id, $attr, $_service_value);
 	}
 
-	# Update the ordering of fields
-	{
-		my @graph_order = split(/ /, $service_attr->{graph_order});
-		DEBUG "_db_service.graph_order: @graph_order";
-		my $ordr = 0;
-		for my $_name (@graph_order) {
-			my $sth_update_ordr = $dbh->prepare_cached("UPDATE ds SET ordr = ? WHERE ds.service_id = ? AND ds.name = ?");
-			$sth_update_ordr->execute($ordr, $service_id, $_name);
-			DEBUG "_db_service.update_order($ordr, $service_id, $_name)";
-			$ordr ++;
-		}
-	}
-
 	# Handle the service_category
 	{
 		my $category = $service_attr->{graph_category} || "other";
@@ -447,6 +431,19 @@ sub _db_service {
 	{
 		my $sth_del_ds = $dbh->prepare_cached('DELETE FROM ds WHERE service_id = ? AND NOT EXISTS (SELECT * FROM ds_attr WHERE ds_attr.id = ds.id)');
 		$sth_del_ds->execute($service_id);
+	}
+
+	# Update the ordering of fields
+	{
+		my @graph_order = split(/ /, $service_attr->{graph_order});
+		DEBUG "_db_service.graph_order: @graph_order";
+		my $ordr = 0;
+		for my $_name (@graph_order) {
+			my $sth_update_ordr = $dbh->prepare_cached("UPDATE ds SET ordr = ? WHERE ds.service_id = ? AND ds.name = ?");
+			$sth_update_ordr->execute($ordr, $service_id, $_name);
+			DEBUG "_db_service.update_order($ordr, $service_id, $_name)";
+			$ordr ++;
+		}
 	}
 
 	$self->_db_url("service", $service_id, $plugin, "node", $node_id);
@@ -579,12 +576,14 @@ sub parse_update_rate {
 	my ($update_rate_config) = @_;
 
 	my ($update_rate_in_sec, $is_update_aligned);
-	if ($update_rate_config =~ m/(\d+[a-z]?)( aligned)?/) {
+	if ($update_rate_config =~ m/(\d+[a-z]?)(?: (.*))?/) {
 		$update_rate_in_sec = to_sec($1);
-		$is_update_aligned = ($2 || 0);
+		$is_update_aligned = $2 && ($2 eq "aligned");
 	} else {
 		return (0, 0);
 	}
+
+	$is_update_aligned ||= 0;
 
 	return ($update_rate_in_sec, $is_update_aligned);
 }
@@ -648,11 +647,18 @@ sub uw_handle_config {
 			next; # Handled
 		}
 
-		$fields{$arg1}{$arg2} = $value;
+		# Prevent plugins from trying to set rrd:* attrs
+		if ($arg2 =~ /^rrd:/) {
+			WARN "Invalid line: $line";
+			next;
+		}
 
-		# Adding the $field if not present.
-		# Using an array since, obviously, the order is important.
-		push @field_order, $arg1;
+		# Adding the $field if not seen before.
+		if (!exists($fields{$arg1})) {
+			push @field_order, $arg1;
+		}
+
+		$fields{$arg1}{$arg2} = $value;
 	}
 
 	$$update_rate_ptr = $service_attr{"update_rate"} if $service_attr{"update_rate"};
@@ -661,7 +667,8 @@ sub uw_handle_config {
 	{
 		my @graph_order = split(/ /, $service_attr{"graph_order"} || "");
 		for my $field (@field_order) {
-			push @graph_order, $field unless grep { $field } @graph_order;
+			# filter out of _exact_ equality
+			push @graph_order, $field unless grep { $_ eq $field } @graph_order;
 		}
 
 		$service_attr{"graph_order"} = join(" ", @graph_order);
@@ -838,9 +845,6 @@ sub _get_rrd_file_name {
                        $ds_name,
                        $type_id);
 
-    $file = File::Spec->catfile($config->{dbdir},
-				$file);
-
     DEBUG "[DEBUG] rrd filename: $file\n";
 
     return $file;
@@ -852,15 +856,17 @@ sub _create_rrd_file {
 
     INFO "[INFO] creating rrd-file for $service->$ds_name: '$rrd_file'";
 
+    $rrd_file = File::Spec->catfile($config->{dbdir}, $rrd_file);
+
     munin_mkdir_p(dirname($rrd_file), oct(777));
 
     my @args;
 
     $ds_config = $self->_get_rrd_data_source_with_defaults($ds_config);
     my $resolution = $ds_config->{graph_data_size};
-    my $update_rate = $ds_config->{update_rate};
+    my ($update_rate_in_sec, $is_update_aligned) = parse_update_rate($ds_config->{update_rate});
     if ($resolution eq 'normal') {
-	$update_rate = 300; # 'normal' means hard coded RRD $update_rate
+	$update_rate_in_sec = 300; # 'normal' means hard coded RRD $update_rate
         push (@args,
               "RRA:AVERAGE:0.5:1:576",   # resolution 5 minutes
               "RRA:MIN:0.5:1:576",
@@ -875,13 +881,13 @@ sub _create_rrd_file {
               "RRA:MIN:0.5:288:450",
               "RRA:MAX:0.5:288:450");
     } elsif ($resolution eq 'huge') {
-	$update_rate = 300; # 'huge' means hard coded RRD $update_rate
+	$update_rate_in_sec = 300; # 'huge' means hard coded RRD $update_rate
         push (@args,
               "RRA:AVERAGE:0.5:1:115200",  # resolution 5 minutes, for 400 days
               "RRA:MIN:0.5:1:115200",
               "RRA:MAX:0.5:1:115200");
     } elsif ($resolution eq 'debug') {
-	$update_rate = 300; # 'debug' means hard coded RRD $update_rate
+	$update_rate_in_sec = 300; # 'debug' means hard coded RRD $update_rate
         push (@args,
               "RRA:AVERAGE:0.5:1:42",  # resolution 5 minutes, for 42 steps
               "RRA:MIN:0.5:1:42",
@@ -889,7 +895,7 @@ sub _create_rrd_file {
     } elsif ($resolution =~ /^custom (.+)/) {
         # Parsing resolution to achieve computer format as defined on the RFC :
         # FULL_NB, MULTIPLIER_1 MULTIPLIER_1_NB, ... MULTIPLIER_NMULTIPLIER_N_NB
-        my @resolutions_computer = parse_custom_resolution($1, $update_rate);
+        my @resolutions_computer = parse_custom_resolution($1, $update_rate_in_sec);
         my @enlarged_resolutions = enlarge_custom_resolution(@resolutions_computer);
         foreach my $resolution_computer(@resolutions_computer) {
             my ($multiplier, $multiplier_nb) = @{$resolution_computer};
@@ -902,17 +908,18 @@ sub _create_rrd_file {
     }
 
     # Add the RRD::create prefix (filename & RRD params)
-    my $heartbeat = $update_rate * 2;
+    my $heartbeat = $update_rate_in_sec * 2;
+    $first_epoch -= $first_epoch % $update_rate_in_sec; # the RRD start should _always_ be aligned
     unshift (@args,
         $rrd_file,
-        "--start", ($first_epoch - $update_rate),
-	"-s", $update_rate,
+        "--start", ($first_epoch - $update_rate_in_sec),
+	"-s", $update_rate_in_sec,
         sprintf('DS:42:%s:%s:%s:%s',
                 $ds_config->{type}, $heartbeat, $ds_config->{min}, $ds_config->{max}),
     );
 
     INFO "[INFO] RRDs::create @args";
-    RRDs::create @args;
+    RRDs::create @args unless $ENV{NO_UPDATE_RRD};
     if (my $ERROR = RRDs::error) {
         ERROR "[ERROR] Unable to create '$rrd_file': $ERROR";
     }
@@ -1010,6 +1017,8 @@ sub to_sec {
 sub _update_rrd_file {
 	my ($self, $rrd_file, $ds_name, $ds_values) = @_;
 
+	$rrd_file = File::Spec->catfile($config->{dbdir}, $rrd_file);
+
 	my $values = $ds_values->{value};
 
 	# Some kind of mismatch between fetch and config can cause this.
@@ -1060,14 +1069,14 @@ sub _update_rrd_file {
 		# https://lists.oetiker.ch/pipermail/rrd-users/2011-October/018196.html
 		for my $update_rrd_data (@update_rrd_data) {
 			DEBUG "RRDs::update($rrd_file, $update_rrd_data)";
-			RRDs::update($rrd_file, $update_rrd_data);
+			RRDs::update($rrd_file, $update_rrd_data) unless $ENV{NO_UPDATE_RRD};
 			# Break on error.
 			last if RRDs::error;
 		}
 	} else {
 		# normal vector-update the RRD
 		DEBUG "RRDs::update($rrd_file, @update_rrd_data)";
-		RRDs::update($rrd_file, @update_rrd_data);
+		RRDs::update($rrd_file, @update_rrd_data) unless $ENV{NO_UPDATE_RRD};
 	}
 
 	if (my $ERROR = RRDs::error) {

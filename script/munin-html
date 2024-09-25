@@ -1,0 +1,144 @@
+#!/usr/bin/perl -T
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+use Munin::Master::Static::HTML;
+
+print_usage_and_exit()
+  unless GetOptions(
+    "jobs|j=i"  => \$Munin::Master::Static::HTML::jobs,
+    "destination|d=s"  => \$Munin::Master::Static::HTML::destination,
+    "version" => \&print_version_and_exit,
+    "help"    => \&print_usage_and_exit,
+  );
+
+Munin::Master::Static::HTML::create();
+
+sub print_usage_and_exit {
+    require Pod::Usage;
+    Pod::Usage::pod2usage( -verbose => 1 );
+}
+
+sub print_version_and_exit {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(
+        -verbose  => 99,
+        -sections => 'VERSION|COPYRIGHT',
+        -exit     => 0,
+    );
+}
+
+package CGI;
+
+sub new {
+        my $c = shift;
+        my $params = shift;
+        return bless $params, $c;
+}
+
+sub path_info {
+	my $self = shift;
+	return $self->{path_info};
+}
+
+sub url_param {
+	my $self = shift;
+	my $param = shift;
+	die("undef") unless defined $param;
+	return $self->{url_param}{$param};
+}
+
+my %header;
+sub header {
+	my $self = shift;
+	%header = @_;
+
+	# No return, so nothing is printed
+	return "";
+}
+
+sub url {
+	my $self = shift;
+	return "";
+}
+
+__END__
+
+=head1 NAME
+
+munin-html - Generate a static version of the HTML pages
+
+=head1 USAGE
+
+munin-html [options]
+
+=head1 REQUIRED ARGUMENTS
+
+None.
+
+=head1 EXIT STATUS
+
+Non-zero on failure.
+
+=head1 DESCRIPTION
+
+munin-html is a simple generator of the HTML pages.
+It doesn't support zooming, but does support multi-process execution, via forking.
+
+=head1 OPTIONS
+
+=over 5
+
+=item B<< --jobs <number of jobs> >>
+
+This is the number of workers jobs to launch.
+Default is 0, meaning no fork is done.
+
+=item B<< --destination <destination directory> >>
+
+Default is "/tmp".
+
+=item B<--help >
+
+View this help message.
+
+=item B<--version >
+
+Show version information.
+
+=back
+
+=head1 VERSION
+
+This is munin-html (munin) v@@VERSION@@
+
+=head1 AUTHOR
+
+Steve Schnepp
+
+=head1 BUGS AND LIMITATIONS
+
+None known. If you found one, please report under L<https://github.com/munin-monitoring/munin/issues>.
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2022 Steve Schnepp
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; version 2 dated June,
+1991.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
